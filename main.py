@@ -9,23 +9,23 @@ POST /answer-audio   (and POST /  as a fallback, in case the grader hits the bas
 
   Pipeline:
     1. Decode audio, detect WAV/MP3 from magic bytes.
-    2. Transcribe with Whisper (via aipipe.org's OpenAI-compatible proxy).
-    3. Ask an LLM to turn the transcript into a structured table
-       ({"columns": [...], "rows": [{...}, ...]}) - JSON mode, no free text.
-    4. Compute every statistic ourselves in Python (never trust the LLM's arithmetic).
-    5. Return the full required JSON shape, every key always present.
+    2. Send the audio directly (as base64 "input_audio" content) to an audio-capable
+       chat model via aipipe.org's /chat/completions endpoint, and ask it in one shot
+       to listen + extract a structured table ({"columns": [...], "rows": [{...}]}).
+       (aipipe's proxy requires a plain JSON body with a "model" field for cost
+       tracking, so we do NOT use the multipart /audio/transcriptions endpoint.)
+    3. Compute every statistic ourselves in Python (never trust the LLM's arithmetic).
+    4. Return the full required JSON shape, every key always present.
 
 Env vars:
-  AIPIPE_TOKEN        - your aipipe.org bearer token (same one used for Q2)
-  TRANSCRIBE_MODEL    - default "whisper-1"
-  EXTRACT_MODEL       - default "gpt-4o-mini"
+  AIPIPE_TOKEN   - your aipipe.org bearer token (same one used for Q2)
+  EXTRACT_MODEL  - default "gpt-4o-audio-preview" (must support audio input)
 """
 
 import base64
 import json
 import os
 import statistics
-from collections import Counter
 from itertools import combinations
 from typing import Any
 
@@ -34,10 +34,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN", "")
-TRANSCRIBE_MODEL = os.environ.get("TRANSCRIBE_MODEL", "whisper-1")
-EXTRACT_MODEL = os.environ.get("EXTRACT_MODEL", "gpt-4o-mini")
+EXTRACT_MODEL = os.environ.get("EXTRACT_MODEL", "gpt-4o-audio-preview")
 
-AIPIPE_TRANSCRIBE_URL = "https://aipipe.org/openai/v1/audio/transcriptions"
 AIPIPE_CHAT_URL = "https://aipipe.org/openai/v1/chat/completions"
 
 app = FastAPI(title="Korean Audio Dataset API")
@@ -85,18 +83,14 @@ def empty_result() -> dict:
     }
 
 
-def detect_audio(raw: bytes) -> tuple[str, str]:
-    """Return (filename, mime) based on magic bytes."""
+def detect_audio_format(raw: bytes) -> str:
+    """Return 'wav' or 'mp3' based on magic bytes (the two formats input_audio supports)."""
     if raw[:4] == b"RIFF" and raw[8:12] == b"WAVE":
-        return "audio.wav", "audio/wav"
+        return "wav"
     if raw[:3] == b"ID3" or raw[:2] == b"\xff\xfb" or raw[:2] == b"\xff\xf3":
-        return "audio.mp3", "audio/mpeg"
-    if raw[:4] == b"OggS":
-        return "audio.ogg", "audio/ogg"
-    if raw[4:8] == b"ftyp":
-        return "audio.m4a", "audio/mp4"
-    # Fallback - most graders send wav
-    return "audio.wav", "audio/wav"
+        return "mp3"
+    # Fallback - the task spec only promises WAV (RIFF) or MP3 (ID3) inputs
+    return "wav"
 
 
 async def get_audio_bytes(request: Request) -> bytes:
@@ -127,30 +121,11 @@ async def get_audio_bytes(request: Request) -> bytes:
     return raw
 
 
-async def transcribe_audio(raw: bytes) -> str:
-    if not AIPIPE_TOKEN:
-        raise HTTPException(status_code=500, detail="AIPIPE_TOKEN is not configured on the server")
+EXTRACT_SYSTEM_PROMPT = """You listen to an audio clip (often Korean speech) that describes a \
+small tabular dataset - rows and columns of data, spoken aloud (numbers and/or category labels). \
+Transcribe it mentally and convert any Korean numerals/words for numbers into actual numbers.
 
-    filename, mime = detect_audio(raw)
-    headers = {"Authorization": f"Bearer {AIPIPE_TOKEN}"}
-    files = {"file": (filename, raw, mime)}
-    data = {"model": TRANSCRIBE_MODEL, "language": "ko", "response_format": "text"}
-
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(AIPIPE_TRANSCRIBE_URL, headers=headers, data=data, files=files)
-
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"transcription error: {resp.status_code} {resp.text[:300]}")
-
-    return resp.text.strip()
-
-
-EXTRACT_SYSTEM_PROMPT = """You convert a (possibly Korean) spoken description of a small \
-tabular dataset into structured JSON. The transcript will describe rows and columns of data \
-(numbers and/or category labels), possibly in Korean words/numerals - convert Korean numerals \
-to actual numbers.
-
-Return ONLY a JSON object of this exact shape, nothing else:
+Return ONLY a JSON object of this exact shape, nothing else, no markdown fences:
 {"columns": ["col1", "col2", ...], "rows": [{"col1": value, "col2": value, ...}, ...]}
 
 Rules:
@@ -160,22 +135,31 @@ Rules:
 - Do not compute or include any statistics yourself - only the raw extracted rows."""
 
 
-async def extract_table(transcript: str) -> dict:
+async def extract_table_from_audio(raw: bytes) -> dict:
     if not AIPIPE_TOKEN:
         raise HTTPException(status_code=500, detail="AIPIPE_TOKEN is not configured on the server")
 
+    audio_format = detect_audio_format(raw)
+    audio_b64 = base64.b64encode(raw).decode()
+
     payload = {
         "model": EXTRACT_MODEL,
+        "modalities": ["text"],
         "temperature": 0,
-        "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Transcript:\n{transcript}"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_audio", "input_audio": {"data": audio_b64, "format": audio_format}},
+                    {"type": "text", "text": "Extract the table as instructed."},
+                ],
+            },
         ],
     }
     headers = {"Authorization": f"Bearer {AIPIPE_TOKEN}", "Content-Type": "application/json"}
 
-    async with httpx.AsyncClient(timeout=90) as client:
+    async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(AIPIPE_CHAT_URL, json=payload, headers=headers)
 
     if resp.status_code != 200:
@@ -186,6 +170,14 @@ async def extract_table(transcript: str) -> dict:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
         raise HTTPException(status_code=502, detail=f"Unexpected extraction response: {data}")
+
+    # Strip markdown code fences if the model added them despite instructions.
+    content = content.strip()
+    if content.startswith("```"):
+        content = content.strip("`")
+        if content.startswith("json"):
+            content = content[4:]
+        content = content.strip()
 
     try:
         parsed = json.loads(content)
@@ -269,8 +261,7 @@ def compute_stats(columns: list[str], rows: list[dict]) -> dict:
 
 async def handle_audio_request(request: Request) -> dict:
     raw = await get_audio_bytes(request)
-    transcript = await transcribe_audio(raw)
-    table = await extract_table(transcript)
+    table = await extract_table_from_audio(raw)
     return compute_stats(table["columns"], table["rows"])
 
 
