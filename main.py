@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN", "")
-EXTRACT_MODEL = os.environ.get("EXTRACT_MODEL", "gpt-4o-audio-preview")
+EXTRACT_MODEL = os.environ.get("EXTRACT_MODEL", "gpt-audio")
 
 AIPIPE_CHAT_URL = "https://aipipe.org/openai/v1/chat/completions"
 
