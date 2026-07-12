@@ -9,23 +9,28 @@ POST /answer-audio   (and POST /  as a fallback, in case the grader hits the bas
 
   Pipeline:
     1. Decode audio, detect WAV/MP3 from magic bytes.
-    2. Send the audio directly (as base64 "input_audio" content) to an audio-capable
-       chat model via aipipe.org's /chat/completions endpoint, and ask it in one shot
-       to listen + extract a structured table ({"columns": [...], "rows": [{...}]}).
-       (aipipe's proxy requires a plain JSON body with a "model" field for cost
-       tracking, so we do NOT use the multipart /audio/transcriptions endpoint.)
-    3. Compute every statistic ourselves in Python (never trust the LLM's arithmetic).
-    4. Return the full required JSON shape, every key always present.
+    2. Transcribe LOCALLY with faster-whisper (open-source, runs in this container -
+       aipipe.org currently has no usable audio path: its /audio/transcriptions proxy
+       rejects multipart uploads, and every gpt-audio* chat model comes back
+       "pricing unknown", so we don't depend on it for the audio step at all).
+    3. Ask a text LLM (via aipipe, same working call as Q2) to turn the transcript into
+       a structured table ({"columns": [...], "rows": [{...}, ...]}).
+    4. Compute every statistic ourselves in Python (never trust the LLM's arithmetic).
+    5. Return the full required JSON shape, every key always present.
 
 Env vars:
-  AIPIPE_TOKEN   - your aipipe.org bearer token (same one used for Q2)
-  EXTRACT_MODEL  - default "gpt-4o-audio-preview" (must support audio input)
+  AIPIPE_TOKEN       - your aipipe.org bearer token (same one used for Q2)
+  EXTRACT_MODEL      - default "gpt-4o-mini" (text-only, known to work via aipipe)
+  WHISPER_MODEL_SIZE - default "base" (tiny/base/small - bigger = more accurate, more RAM)
+
+Requires a Docker deploy (see Dockerfile) so ffmpeg is available for faster-whisper.
 """
 
 import base64
 import json
 import os
 import statistics
+import tempfile
 from itertools import combinations
 from typing import Any
 
@@ -34,7 +39,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN", "")
-EXTRACT_MODEL = os.environ.get("EXTRACT_MODEL", "gpt-audio")
+EXTRACT_MODEL = os.environ.get("EXTRACT_MODEL", "gpt-4o-mini")
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "base")
 
 AIPIPE_CHAT_URL = "https://aipipe.org/openai/v1/chat/completions"
 
@@ -64,6 +70,17 @@ REQUIRED_KEYS = [
     "correlation",
 ]
 
+_whisper_model = None  # lazy-loaded so the server binds to $PORT immediately
+
+
+def get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+
+        _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+    return _whisper_model
+
 
 def empty_result() -> dict:
     return {
@@ -83,14 +100,17 @@ def empty_result() -> dict:
     }
 
 
-def detect_audio_format(raw: bytes) -> str:
-    """Return 'wav' or 'mp3' based on magic bytes (the two formats input_audio supports)."""
+def detect_audio_suffix(raw: bytes) -> str:
+    """Return a file suffix based on magic bytes so ffmpeg/faster-whisper can sniff format."""
     if raw[:4] == b"RIFF" and raw[8:12] == b"WAVE":
-        return "wav"
+        return ".wav"
     if raw[:3] == b"ID3" or raw[:2] == b"\xff\xfb" or raw[:2] == b"\xff\xf3":
-        return "mp3"
-    # Fallback - the task spec only promises WAV (RIFF) or MP3 (ID3) inputs
-    return "wav"
+        return ".mp3"
+    if raw[:4] == b"OggS":
+        return ".ogg"
+    if raw[4:8] == b"ftyp":
+        return ".m4a"
+    return ".wav"
 
 
 async def get_audio_bytes(request: Request) -> bytes:
@@ -114,16 +134,27 @@ async def get_audio_bytes(request: Request) -> bytes:
                 return await value.read()
         raise HTTPException(status_code=400, detail="No file found in multipart form")
 
-    # Raw binary body (audio/wav, audio/mpeg, application/octet-stream, ...)
     raw = await request.body()
     if not raw:
         raise HTTPException(status_code=400, detail="Empty request body")
     return raw
 
 
-EXTRACT_SYSTEM_PROMPT = """You listen to an audio clip (often Korean speech) that describes a \
-small tabular dataset - rows and columns of data, spoken aloud (numbers and/or category labels). \
-Transcribe it mentally and convert any Korean numerals/words for numbers into actual numbers.
+def transcribe_audio_local(raw: bytes) -> str:
+    model = get_whisper_model()
+    suffix = detect_audio_suffix(raw)
+
+    with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
+        tmp.write(raw)
+        tmp.flush()
+        segments, _info = model.transcribe(tmp.name, language="ko", beam_size=5)
+        return " ".join(seg.text.strip() for seg in segments).strip()
+
+
+EXTRACT_SYSTEM_PROMPT = """You convert a (possibly Korean) spoken description of a small \
+tabular dataset into structured JSON. The transcript describes rows and columns of data \
+(numbers and/or category labels), possibly with Korean numerals/words - convert those to \
+actual numbers.
 
 Return ONLY a JSON object of this exact shape, nothing else, no markdown fences:
 {"columns": ["col1", "col2", ...], "rows": [{"col1": value, "col2": value, ...}, ...]}
@@ -135,31 +166,22 @@ Rules:
 - Do not compute or include any statistics yourself - only the raw extracted rows."""
 
 
-async def extract_table_from_audio(raw: bytes) -> dict:
+async def extract_table(transcript: str) -> dict:
     if not AIPIPE_TOKEN:
         raise HTTPException(status_code=500, detail="AIPIPE_TOKEN is not configured on the server")
 
-    audio_format = detect_audio_format(raw)
-    audio_b64 = base64.b64encode(raw).decode()
-
     payload = {
         "model": EXTRACT_MODEL,
-        "modalities": ["text"],
         "temperature": 0,
+        "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_audio", "input_audio": {"data": audio_b64, "format": audio_format}},
-                    {"type": "text", "text": "Extract the table as instructed."},
-                ],
-            },
+            {"role": "user", "content": f"Transcript:\n{transcript}"},
         ],
     }
     headers = {"Authorization": f"Bearer {AIPIPE_TOKEN}", "Content-Type": "application/json"}
 
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient(timeout=90) as client:
         resp = await client.post(AIPIPE_CHAT_URL, json=payload, headers=headers)
 
     if resp.status_code != 200:
@@ -171,7 +193,6 @@ async def extract_table_from_audio(raw: bytes) -> dict:
     except (KeyError, IndexError, TypeError):
         raise HTTPException(status_code=502, detail=f"Unexpected extraction response: {data}")
 
-    # Strip markdown code fences if the model added them despite instructions.
     content = content.strip()
     if content.startswith("```"):
         content = content.strip("`")
@@ -233,7 +254,6 @@ def compute_stats(columns: list[str], rows: list[dict]) -> dict:
     correlations = []
     numeric_names = list(numeric_cols.keys())
     for a, b in combinations(numeric_names, 2):
-        # Only rows where both columns have numeric values, pair them up positionally.
         pairs = [
             (r.get(a), r.get(b))
             for r in rows
@@ -261,7 +281,8 @@ def compute_stats(columns: list[str], rows: list[dict]) -> dict:
 
 async def handle_audio_request(request: Request) -> dict:
     raw = await get_audio_bytes(request)
-    table = await extract_table_from_audio(raw)
+    transcript = transcribe_audio_local(raw)
+    table = await extract_table(transcript)
     return compute_stats(table["columns"], table["rows"])
 
 
